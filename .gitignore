@@ -1,0 +1,9 @@
+.vs/
+bin/
+logs/
+obj/
+.vscode/
+EmailToDiscord/config.yaml
+EmailToDiscord/data/
+EmailToDiscord/templates/*.md
+EmailToDiscord/canned-replies/*.md

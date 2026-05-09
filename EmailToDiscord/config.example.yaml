@@ -1,0 +1,35 @@
+discord:
+  token: "XXX"
+  command_prefix: "!reply"
+  guild_ids:
+    - YYY
+
+canned_replies:
+  path: "./canned-replies/"
+
+polling:
+  interval_seconds: 300
+
+state:
+  file_path: "./data/state.json"
+  thread_db_path: "./data/threads.db"
+
+mailboxes:
+  - name: "Donut Team Support"
+    email: "support@donutteam.com"
+    forum_channel_id: 1502379967214784572
+    imap:
+      host: "imap.zoho.com"
+      port: 993
+      username: "support@donutteam.com"
+      password: "${DT_SUPPORT_IMAP_PASSWORD}"
+      use_ssl: true
+      folder: "INBOX"
+    smtp:
+      host: "smtp.zoho.com"
+      port: 587
+      username: "support@donutteam.com"
+      password: "${DT_SUPPORT_SMTP_PASSWORD}"
+      use_starttls: true
+      from_name: "Donut Team Support"
+    template_path: "./templates/donutteam.md"
