@@ -264,7 +264,10 @@ public class DiscordBotService : IHostedService
 
         try
         {
-            var title = TruncateForTitle(email.Subject, MaxForumTitle);
+            var titleSource = string.IsNullOrWhiteSpace(email.Subject)
+                ? $"(no subject) — {email.FromAddress}"
+                : email.Subject;
+            var title = TruncateForTitle(titleSource, MaxForumTitle);
             IThreadChannel post;
 
             if (attachments.Count > 0)

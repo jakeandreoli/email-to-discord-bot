@@ -15,21 +15,21 @@ state:
   thread_db_path: "./data/threads.db"
 
 mailboxes:
-  - name: "Donut Team Support"
-    email: "support@donutteam.com"
+  - name: "Support"
+    email: "support@example.com"
     forum_channel_id: 1502379967214784572
     imap:
       host: "imap.zoho.com"
       port: 993
-      username: "support@donutteam.com"
-      password: "${DT_SUPPORT_IMAP_PASSWORD}"
+      username: "support@example.com"
+      password: "${SUPPORT_IMAP_PASSWORD}"
       use_ssl: true
       folder: "INBOX"
     smtp:
       host: "smtp.zoho.com"
       port: 587
-      username: "support@donutteam.com"
-      password: "${DT_SUPPORT_SMTP_PASSWORD}"
+      username: "support@example.com"
+      password: "${SUPPORT_SMTP_PASSWORD}"
       use_starttls: true
-      from_name: "Donut Team Support"
-    template_path: "./templates/donutteam.md"
+      from_name: "Support"
+    template_path: "./templates/support.md"
