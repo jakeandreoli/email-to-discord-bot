@@ -12,6 +12,16 @@ public record ThreadRecord(
     bool AwaitingCustomer
 );
 
+public record MailboxCount(string MailboxEmail, int Count);
+public record TicketCounts(int Total, IReadOnlyList<MailboxCount> PerMailbox);
+public record TagCount(string Tag, int Count);
+public record MailboxTagCount(string MailboxEmail, string Tag, int Count);
+public record CannedReplyStats(
+    int Total,
+    IReadOnlyList<TagCount> PerTag,
+    IReadOnlyList<MailboxTagCount> PerMailboxTag
+);
+
 public class ThreadStore
 {
     private readonly string _connectionString;
@@ -45,6 +55,17 @@ public class ThreadStore
                 latest_inbound_msgid  TEXT    NULL,
                 awaiting_customer     INTEGER NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS canned_reply_usage (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                tag             TEXT    NOT NULL,
+                mailbox_email   TEXT    NOT NULL,
+                sent_by         INTEGER NOT NULL,
+                thread_id       INTEGER NOT NULL,
+                sent_at         INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cru_tag ON canned_reply_usage(tag);
+            CREATE INDEX IF NOT EXISTS idx_cru_mailbox ON canned_reply_usage(mailbox_email);
         ";
         cmd.ExecuteNonQuery();
 
@@ -136,6 +157,100 @@ public class ThreadStore
             ";
             cmd.Parameters.AddWithValue("$tid", (long)discordThreadId);
             cmd.ExecuteNonQuery();
+        }
+    }
+
+    public void RecordCannedReplyUsage(string tag, string mailboxEmail, ulong sentBy, ulong threadId)
+    {
+        lock (_lock)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                INSERT INTO canned_reply_usage (tag, mailbox_email, sent_by, thread_id, sent_at)
+                VALUES ($tag, $mbox, $by, $tid, $at);
+            ";
+            cmd.Parameters.AddWithValue("$tag", tag);
+            cmd.Parameters.AddWithValue("$mbox", mailboxEmail);
+            cmd.Parameters.AddWithValue("$by", (long)sentBy);
+            cmd.Parameters.AddWithValue("$tid", (long)threadId);
+            cmd.Parameters.AddWithValue("$at", DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            cmd.ExecuteNonQuery();
+        }
+    }
+
+    public TicketCounts GetTicketCounts()
+    {
+        lock (_lock)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                SELECT mailbox_email, COUNT(*) AS c
+                FROM threads
+                GROUP BY mailbox_email
+                ORDER BY c DESC;
+            ";
+
+            var perMailbox = new List<MailboxCount>();
+            var total = 0;
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                var count = (int)reader.GetInt64(1);
+                perMailbox.Add(new MailboxCount(reader.GetString(0), count));
+                total += count;
+            }
+            return new TicketCounts(total, perMailbox);
+        }
+    }
+
+    public CannedReplyStats GetCannedReplyStats()
+    {
+        lock (_lock)
+        {
+            using var conn = Open();
+
+            var perTag = new List<TagCount>();
+            var total = 0;
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"
+                    SELECT tag, COUNT(*) AS c
+                    FROM canned_reply_usage
+                    GROUP BY tag
+                    ORDER BY c DESC, tag ASC;
+                ";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    var count = (int)reader.GetInt64(1);
+                    perTag.Add(new TagCount(reader.GetString(0), count));
+                    total += count;
+                }
+            }
+
+            var perMailboxTag = new List<MailboxTagCount>();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"
+                    SELECT mailbox_email, tag, COUNT(*) AS c
+                    FROM canned_reply_usage
+                    GROUP BY mailbox_email, tag
+                    ORDER BY mailbox_email ASC, c DESC, tag ASC;
+                ";
+                using var reader = cmd.ExecuteReader();
+                while (reader.Read())
+                {
+                    perMailboxTag.Add(new MailboxTagCount(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        (int)reader.GetInt64(2)
+                    ));
+                }
+            }
+
+            return new CannedReplyStats(total, perTag, perMailboxTag);
         }
     }
 }

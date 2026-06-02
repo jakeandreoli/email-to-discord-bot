@@ -31,6 +31,7 @@ public class DiscordBotService : IHostedService
     private const string PendingReplyYesPrefix = "pr:y:";
     private const string PendingReplyNoPrefix = "pr:n:";
     private const string RefreshEmailCommandName = "refresh-email";
+    private const string EmailStatsCommandName = "email-stats";
     private const int MaxAutocompleteChoices = 25;
     private const string MetaPrefix = "[bridge]";
     private static readonly TimeSpan PendingReplyTtl = TimeSpan.FromMinutes(10);
@@ -197,7 +198,12 @@ public class DiscordBotService : IHostedService
             .WithDescription("Force an immediate poll of all configured mailboxes.")
             .Build();
 
-        var commands = new[] { cannedReplyCommand, refreshEmailCommand };
+        var emailStatsCommand = new SlashCommandBuilder()
+            .WithName(EmailStatsCommandName)
+            .WithDescription("Show ticket and canned-reply usage stats.")
+            .Build();
+
+        var commands = new[] { cannedReplyCommand, refreshEmailCommand, emailStatsCommand };
 
         foreach (var gid in _config.Discord.GuildIds)
         {
@@ -739,6 +745,12 @@ public class DiscordBotService : IHostedService
                 return;
             }
 
+            if (command.Data.Name == EmailStatsCommandName)
+            {
+                await HandleEmailStatsAsync(command, dispatchLagMs);
+                return;
+            }
+
             if (command.Data.Name != CannedReplyCommandName)
                 return;
 
@@ -861,6 +873,99 @@ public class DiscordBotService : IHostedService
         }
     }
 
+    private async Task HandleEmailStatsAsync(SocketSlashCommand command, double dispatchLagMs)
+    {
+        var deferStart = DateTimeOffset.UtcNow;
+        try
+        {
+            await command.DeferAsync(ephemeral: true);
+        }
+        catch (Discord.Net.HttpException dex) when ((int)dex.DiscordCode == 10062)
+        {
+            var deferElapsedMs = (DateTimeOffset.UtcNow - deferStart).TotalMilliseconds;
+            _logger.LogWarning(
+                "/email-stats interaction {Id} expired before defer. " +
+                "dispatch_lag={DispatchLagMs:F0}ms, defer_call={DeferElapsedMs:F0}ms",
+                command.Id, dispatchLagMs, deferElapsedMs
+            );
+            return;
+        }
+
+        try
+        {
+            var tickets = _threadStore.GetTicketCounts();
+            var canned = _threadStore.GetCannedReplyStats();
+
+            var embed = BuildStatsEmbed(tickets, canned);
+            await command.ModifyOriginalResponseAsync(p => p.Embed = embed);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "/email-stats handler failed");
+            await command.ModifyOriginalResponseAsync(p => p.Content = $"Stats failed: {ex.Message}");
+        }
+    }
+
+    private static Embed BuildStatsEmbed(TicketCounts tickets, CannedReplyStats canned)
+    {
+        const int MaxFieldChars = 1024;
+        const int TopTagsGlobal = 15;
+        const int TopTagsPerMailbox = 5;
+
+        var builder = new EmbedBuilder()
+            .WithTitle("📊 Email Stats")
+            .WithTimestamp(DateTimeOffset.UtcNow);
+
+        var ticketsBody = new StringBuilder();
+        ticketsBody.AppendLine($"**Total:** {tickets.Total}");
+        if (tickets.PerMailbox.Count > 0)
+        {
+            ticketsBody.AppendLine();
+            foreach (var m in tickets.PerMailbox)
+                ticketsBody.AppendLine($"• `{m.MailboxEmail}` — {m.Count}");
+        }
+        builder.AddField("Tickets created", TruncateForField(ticketsBody.ToString(), MaxFieldChars), false);
+
+        var cannedBody = new StringBuilder();
+        cannedBody.AppendLine($"**Total:** {canned.Total}");
+        if (canned.PerTag.Count > 0)
+        {
+            cannedBody.AppendLine();
+            foreach (var t in canned.PerTag.Take(TopTagsGlobal))
+                cannedBody.AppendLine($"• `{t.Tag}` — {t.Count}");
+
+            if (canned.PerTag.Count > TopTagsGlobal)
+                cannedBody.AppendLine($"…and {canned.PerTag.Count - TopTagsGlobal} more");
+        }
+        builder.AddField("Canned replies sent", TruncateForField(cannedBody.ToString(), MaxFieldChars), false);
+
+        var perMailboxGroups = canned.PerMailboxTag
+            .GroupBy(x => x.MailboxEmail)
+            .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var group in perMailboxGroups)
+        {
+            var body = new StringBuilder();
+            foreach (var t in group.Take(TopTagsPerMailbox))
+                body.AppendLine($"• `{t.Tag}` — {t.Count}");
+
+            var extra = group.Count() - TopTagsPerMailbox;
+            if (extra > 0)
+                body.AppendLine($"…and {extra} more");
+
+            builder.AddField($"{group.Key} — canned replies", TruncateForField(body.ToString(), MaxFieldChars), true);
+        }
+
+        return builder.Build();
+    }
+
+    private static string TruncateForField(string text, int maxLen)
+    {
+        if (string.IsNullOrEmpty(text))
+            return "—";
+        return text.Length <= maxLen ? text : string.Concat(text.AsSpan(0, maxLen - 3), "...");
+    }
+
     private async Task OnButtonAsync(SocketMessageComponent component)
     {
         try
@@ -932,6 +1037,7 @@ public class DiscordBotService : IHostedService
             try
             {
                 await SendThreadReplyAsync(thread, mailbox, body, [], CancellationToken.None);
+                _threadStore.RecordCannedReplyUsage(tag, mailbox.Email, component.User.Id, thread.Id);
 
                 await thread.SendMessageAsync($"<@{component.User.Id}> sent the **{tag}** canned reply");
 
