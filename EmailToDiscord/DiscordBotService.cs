@@ -275,14 +275,18 @@ public class DiscordBotService : IHostedService
                 post = await forum.CreatePostWithFilesAsync(
                     title,
                     attachments,
+                    text: email.FromAddress,
                     embeds: [embed],
+                    allowedMentions: AllowedMentions.None,
                     options: new RequestOptions { CancelToken = ct });
             }
             else
             {
                 post = await forum.CreatePostAsync(
                     title,
+                    text: email.FromAddress,
                     embeds: [embed],
+                    allowedMentions: AllowedMentions.None,
                     options: new RequestOptions { CancelToken = ct });
             }
 
