@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.RegularExpressions;
 using Discord;
@@ -27,9 +28,22 @@ public class DiscordBotService : IHostedService
     private const string CannedReplyTagOption = "tag";
     private const string CannedYesPrefix = "cr:y:";
     private const string CannedNoId = "cr:n";
+    private const string PendingReplyYesPrefix = "pr:y:";
+    private const string PendingReplyNoPrefix = "pr:n:";
     private const string RefreshEmailCommandName = "refresh-email";
     private const int MaxAutocompleteChoices = 25;
     private const string MetaPrefix = "[bridge]";
+    private static readonly TimeSpan PendingReplyTtl = TimeSpan.FromMinutes(10);
+
+    private readonly ConcurrentDictionary<string, PendingReply> _pendingReplies = new();
+
+    private record PendingReply(
+        string Body,
+        IReadOnlyList<EmailAttachment> Attachments,
+        ulong ThreadId,
+        ulong TriggerMessageId,
+        DateTimeOffset Expires
+    );
 
     // Discord limits
     private const int MaxEmbedDescription = 4000; // cap is 4096; leave room
@@ -449,6 +463,14 @@ public class DiscordBotService : IHostedService
 
             var emailAttachments = await DownloadDiscordAttachmentsAsync(msg.Attachments);
 
+            PruneExpiredPending();
+            var record = _threadStore.Get(thread.Id);
+            if (record?.AwaitingCustomer == true)
+            {
+                await PostPendingReplyConfirmationAsync(thread, msg, replyBody, emailAttachments);
+                return;
+            }
+
             try
             {
                 await SendThreadReplyAsync(thread, mailbox, replyBody, emailAttachments, CancellationToken.None);
@@ -501,6 +523,52 @@ public class DiscordBotService : IHostedService
             attachments,
             ct
         );
+
+        _threadStore.RecordOutbound(thread.Id);
+    }
+
+    private void PruneExpiredPending()
+    {
+        var now = DateTimeOffset.UtcNow;
+        foreach (var kv in _pendingReplies)
+        {
+            if (kv.Value.Expires < now)
+                _pendingReplies.TryRemove(kv.Key, out _);
+        }
+    }
+
+    private async Task PostPendingReplyConfirmationAsync(
+        SocketThreadChannel thread,
+        SocketUserMessage trigger,
+        string body,
+        IReadOnlyList<EmailAttachment> attachments
+    )
+    {
+        var token = Guid.NewGuid().ToString("N")[..8];
+        _pendingReplies[token] = new PendingReply(
+            body,
+            attachments,
+            thread.Id,
+            trigger.Id,
+            DateTimeOffset.UtcNow + PendingReplyTtl
+        );
+
+        var components = new ComponentBuilder()
+            .WithButton("Send anyway", PendingReplyYesPrefix + token, ButtonStyle.Danger)
+            .WithButton("Cancel", PendingReplyNoPrefix + token, ButtonStyle.Secondary)
+            .Build();
+
+        var allowed = new AllowedMentions();
+        allowed.UserIds.Add(trigger.Author.Id);
+
+        await thread.SendMessageAsync(
+            text: $"<@{trigger.Author.Id}>: The customer hasn't replied to your last email. Send anyway?",
+            components: components,
+            messageReference: new MessageReference(trigger.Id),
+            allowedMentions: allowed
+        );
+
+        await trigger.AddReactionAsync(new Emoji("⚠️"));
     }
 
     private async Task<ThreadMeta?> ResolveThreadMetaAsync(SocketThreadChannel thread, string mailboxEmail)
@@ -724,9 +792,14 @@ public class DiscordBotService : IHostedService
                 .WithButton("Cancel", CannedNoId, ButtonStyle.Secondary)
                 .Build();
 
+            var record = _threadStore.Get(thread.Id);
+            var warning = record?.AwaitingCustomer == true
+                ? "The customer hasn't replied to your last email. "
+                : "";
+
             await command.ModifyOriginalResponseAsync(p =>
             {
-                p.Content = "Send this as a reply to the customer?";
+                p.Content = warning + "Send this as a reply to the customer?";
                 p.Embed = embed;
                 p.Components = components;
             });
@@ -793,6 +866,13 @@ public class DiscordBotService : IHostedService
         try
         {
             var id = component.Data.CustomId ?? "";
+
+            if (id.StartsWith(PendingReplyYesPrefix) || id.StartsWith(PendingReplyNoPrefix))
+            {
+                await HandlePendingReplyButtonAsync(component, id);
+                return;
+            }
+
             if (!id.StartsWith("cr:"))
                 return;
 
@@ -876,6 +956,83 @@ public class DiscordBotService : IHostedService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Button handler failed");
+        }
+    }
+
+    private async Task HandlePendingReplyButtonAsync(SocketMessageComponent component, string id)
+    {
+        var isYes = id.StartsWith(PendingReplyYesPrefix);
+        var token = id[(isYes ? PendingReplyYesPrefix.Length : PendingReplyNoPrefix.Length)..];
+
+        if (!_pendingReplies.TryRemove(token, out var pending))
+        {
+            await component.UpdateAsync(p =>
+            {
+                p.Content = "This confirmation has expired or already been handled.";
+                p.Components = new ComponentBuilder().Build();
+            });
+            return;
+        }
+
+        if (component.Channel is not SocketThreadChannel thread || thread.Id != pending.ThreadId)
+        {
+            await component.UpdateAsync(p =>
+            {
+                p.Content = "Thread context lost.";
+                p.Components = new ComponentBuilder().Build();
+            });
+            return;
+        }
+
+        var mailbox = _config.Mailboxes.FirstOrDefault(m => m.ForumChannelId == thread.ParentChannel?.Id);
+        if (mailbox == null)
+        {
+            await component.UpdateAsync(p =>
+            {
+                p.Content = "This thread isn't bound to a configured mailbox.";
+                p.Components = new ComponentBuilder().Build();
+            });
+            return;
+        }
+
+        if (!isYes)
+        {
+            await component.UpdateAsync(p =>
+            {
+                p.Content = $"Cancelled by <@{component.User.Id}>.";
+                p.Components = new ComponentBuilder().Build();
+            });
+            return;
+        }
+
+        try
+        {
+            await SendThreadReplyAsync(thread, mailbox, pending.Body, pending.Attachments, CancellationToken.None);
+            await component.UpdateAsync(p =>
+            {
+                p.Content = $"Sent by <@{component.User.Id}>.";
+                p.Components = new ComponentBuilder().Build();
+            });
+
+            try
+            {
+                var triggerMsg = await thread.GetMessageAsync(pending.TriggerMessageId);
+                if (triggerMsg is IUserMessage userMsg)
+                    await userMsg.AddReactionAsync(new Emoji("📧"));
+            }
+            catch
+            {
+                // Trigger message may have been deleted; non-fatal.
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send confirmed reply for thread {ThreadId}", thread.Id);
+            await component.UpdateAsync(p =>
+            {
+                p.Content = $"Failed to send: `{ex.Message}`";
+                p.Components = new ComponentBuilder().Build();
+            });
         }
     }
 }

@@ -8,7 +8,8 @@ public record ThreadRecord(
     string CustomerEmail,
     string OriginalSubject,
     string MailboxEmail,
-    string? LatestInboundMsgId
+    string? LatestInboundMsgId,
+    bool AwaitingCustomer
 );
 
 public class ThreadStore
@@ -41,10 +42,22 @@ public class ThreadStore
                 customer_email        TEXT    NOT NULL,
                 original_subject      TEXT    NOT NULL,
                 mailbox_email         TEXT    NOT NULL,
-                latest_inbound_msgid  TEXT    NULL
+                latest_inbound_msgid  TEXT    NULL,
+                awaiting_customer     INTEGER NOT NULL DEFAULT 0
             );
         ";
         cmd.ExecuteNonQuery();
+
+        try
+        {
+            using var migrate = conn.CreateCommand();
+            migrate.CommandText = "ALTER TABLE threads ADD COLUMN awaiting_customer INTEGER NOT NULL DEFAULT 0;";
+            migrate.ExecuteNonQuery();
+        }
+        catch (SqliteException)
+        {
+            // Column already exists on pre-existing DBs.
+        }
     }
 
     private SqliteConnection Open()
@@ -67,10 +80,11 @@ public class ThreadStore
             using var conn = Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"
-                INSERT INTO threads (discord_thread_id, customer_email, original_subject, mailbox_email, latest_inbound_msgid)
-                VALUES ($tid, $email, $subj, $mbox, $msgid)
+                INSERT INTO threads (discord_thread_id, customer_email, original_subject, mailbox_email, latest_inbound_msgid, awaiting_customer)
+                VALUES ($tid, $email, $subj, $mbox, $msgid, 0)
                 ON CONFLICT(discord_thread_id) DO UPDATE SET
-                    latest_inbound_msgid = COALESCE(excluded.latest_inbound_msgid, threads.latest_inbound_msgid);
+                    latest_inbound_msgid = COALESCE(excluded.latest_inbound_msgid, threads.latest_inbound_msgid),
+                    awaiting_customer = 0;
             ";
             cmd.Parameters.AddWithValue("$tid", (long)discordThreadId);
             cmd.Parameters.AddWithValue("$email", customerEmail);
@@ -88,7 +102,7 @@ public class ThreadStore
             using var conn = Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"
-                SELECT customer_email, original_subject, mailbox_email, latest_inbound_msgid
+                SELECT customer_email, original_subject, mailbox_email, latest_inbound_msgid, awaiting_customer
                 FROM threads
                 WHERE discord_thread_id = $tid;
             ";
@@ -103,8 +117,25 @@ public class ThreadStore
                 reader.GetString(0),
                 reader.GetString(1),
                 reader.GetString(2),
-                reader.IsDBNull(3) ? null : reader.GetString(3)
+                reader.IsDBNull(3) ? null : reader.GetString(3),
+                reader.GetInt64(4) != 0
             );
+        }
+    }
+
+    public void RecordOutbound(ulong discordThreadId)
+    {
+        lock (_lock)
+        {
+            using var conn = Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+                UPDATE threads
+                SET awaiting_customer = 1
+                WHERE discord_thread_id = $tid;
+            ";
+            cmd.Parameters.AddWithValue("$tid", (long)discordThreadId);
+            cmd.ExecuteNonQuery();
         }
     }
 }
