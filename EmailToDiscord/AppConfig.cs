@@ -7,6 +7,12 @@ public class AppConfig
     public PollingConfig Polling { get; set; } = new();
     public StateConfig State { get; set; } = new();
     public CannedRepliesConfig CannedReplies { get; set; } = new();
+    public AutoresponderConfig Autoresponder { get; set; } = new();
+}
+
+public class AutoresponderConfig
+{
+    public string Footer { get; set; } = "";
 }
 
 public class DiscordConfig

@@ -7,6 +7,9 @@ discord:
 canned_replies:
   path: "./canned-replies/"
 
+autoresponder:
+  footer: "*This is an automated response.*"
+
 polling:
   interval_seconds: 300
 

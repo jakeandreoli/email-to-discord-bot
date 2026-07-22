@@ -18,7 +18,7 @@ public class DiscordBotService : IHostedService
     private readonly ContentConverter _converter;
     private readonly ThreadStore _threadStore;
     private readonly CannedReplyService _cannedReplies;
-    // Lazy-resolved to break the DI cycle: EmailPollingService already depends on this service.
+    private readonly AutoresponderService _autoresponder;
     private readonly IServiceProvider _services;
     private readonly ILogger<DiscordBotService> _logger;
     private readonly DiscordSocketClient _client;
@@ -30,6 +30,8 @@ public class DiscordBotService : IHostedService
     private const string CannedNoId = "cr:n";
     private const string PendingReplyYesPrefix = "pr:y:";
     private const string PendingReplyNoPrefix = "pr:n:";
+    private const string AutoReplyYesPrefix = "ar:y:";
+    private const string AutoReplyNoId = "ar:n";
     private const string RefreshEmailCommandName = "refresh-email";
     private const string EmailStatsCommandName = "email-stats";
     private const int MaxAutocompleteChoices = 25;
@@ -61,6 +63,7 @@ public class DiscordBotService : IHostedService
         ContentConverter converter,
         ThreadStore threadStore,
         CannedReplyService cannedReplies,
+        AutoresponderService autoresponder,
         IServiceProvider services,
         ILogger<DiscordBotService> logger
     )
@@ -70,6 +73,7 @@ public class DiscordBotService : IHostedService
         _converter = converter;
         _threadStore = threadStore;
         _cannedReplies = cannedReplies;
+        _autoresponder = autoresponder;
         _services = services;
         _logger = logger;
 
@@ -274,10 +278,12 @@ public class DiscordBotService : IHostedService
             );
         }
 
-        await CreateNewForumPostAsync(mailbox, forum, email, ct);
+        var post = await CreateNewForumPostAsync(mailbox, forum, email, ct);
+        if (post != null)
+            await MaybeAutoRespondAsync(mailbox, post, email, ct);
     }
 
-    private async Task CreateNewForumPostAsync(MailboxConfig mailbox, IForumChannel forum, IncomingEmail email, CancellationToken ct)
+    private async Task<IThreadChannel?> CreateNewForumPostAsync(MailboxConfig mailbox, IForumChannel forum, IncomingEmail email, CancellationToken ct)
     {
         var (embed, longBodyAttachment) = BuildIncomingEmbed(email);
         var attachments = BuildDiscordAttachments(email.Attachments, longBodyAttachment);
@@ -312,6 +318,7 @@ public class DiscordBotService : IHostedService
 
             _threadStore.RecordInbound(post.Id, email.FromAddress, email.Subject ?? "", mailbox.Email, email.MessageId);
             _logger.LogInformation("Created forum post {ThreadId} from {From}", post.Id, email.FromAddress);
+            return post;
         }
         finally
         {
@@ -519,18 +526,130 @@ public class DiscordBotService : IHostedService
         if (meta == null || string.IsNullOrEmpty(meta.CustomerEmail))
             throw new InvalidOperationException("Could not resolve customer email for this thread.");
 
-        await _sender.SendReplyAsync(
+        await SendReplyCoreAsync(
+            thread.Id,
             mailbox,
             meta.CustomerEmail,
-            meta.OriginalSubject ?? "Support",
-            replyBody,
-            thread.Id,
+            meta.OriginalSubject,
             meta.LatestMessageId,
+            replyBody,
             attachments,
+            footer: null,
+            ct
+        );
+    }
+
+    private async Task SendReplyCoreAsync(
+        ulong threadId,
+        MailboxConfig mailbox,
+        string customerEmail,
+        string? originalSubject,
+        string? inReplyToMessageId,
+        string replyBody,
+        IEnumerable<EmailAttachment> attachments,
+        string? footer,
+        CancellationToken ct
+    )
+    {
+        await _sender.SendReplyAsync(
+            mailbox,
+            customerEmail,
+            originalSubject ?? "Support",
+            replyBody,
+            threadId,
+            inReplyToMessageId,
+            attachments,
+            footer,
             ct
         );
 
-        _threadStore.RecordOutbound(thread.Id);
+        _threadStore.RecordOutbound(threadId);
+    }
+
+    private async Task MaybeAutoRespondAsync(MailboxConfig mailbox, IThreadChannel post, IncomingEmail email, CancellationToken ct)
+    {
+        try
+        {
+            if (email.IsAutomated)
+            {
+                _logger.LogDebug("Skipping autoresponder for automated mail from {From}", email.FromAddress);
+                return;
+            }
+
+            var reply = _autoresponder.Match(email);
+            if (reply == null)
+                return;
+
+            if (reply.Mode == AutoReplyMode.Auto)
+                await AutoSendReplyAsync(mailbox, post, reply, ct);
+            else
+                await SuggestReplyAsync(post, reply, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Autoresponder failed for thread {ThreadId}", post.Id);
+        }
+    }
+
+    private async Task AutoSendReplyAsync(MailboxConfig mailbox, IThreadChannel post, CannedReply reply, CancellationToken ct)
+    {
+        var record = _threadStore.Get(post.Id);
+        if (record == null || string.IsNullOrEmpty(record.CustomerEmail))
+        {
+            _logger.LogWarning("Cannot auto-send {Tag}: no customer email recorded for thread {ThreadId}", reply.Tag, post.Id);
+            return;
+        }
+
+        await SendReplyCoreAsync(
+            post.Id,
+            mailbox,
+            record.CustomerEmail,
+            record.OriginalSubject,
+            record.LatestInboundMsgId,
+            reply.Body,
+            [],
+            _config.Autoresponder.Footer,
+            ct
+        );
+
+        _threadStore.RecordCannedReplyUsage(reply.Tag, mailbox.Email, _client.CurrentUser.Id, post.Id);
+
+        try
+        {
+            await post.SendMessageAsync(
+                $"Auto-replied with the **{reply.Tag}** canned reply.",
+                allowedMentions: AllowedMentions.None,
+                options: new RequestOptions { CancelToken = ct }
+            );
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to post auto-reply note in thread {ThreadId}", post.Id);
+        }
+    }
+
+    private async Task SuggestReplyAsync(IThreadChannel post, CannedReply reply, CancellationToken ct)
+    {
+        var preview = reply.Body.Length > MaxEmbedDescription
+            ? string.Concat(reply.Body.AsSpan(0, MaxEmbedDescription - 20), "\n\n*...truncated*")
+            : reply.Body;
+
+        var embed = new EmbedBuilder()
+            .WithTitle($"Suggested canned reply: {reply.Tag}")
+            .WithDescription(preview)
+            .Build();
+
+        var components = new ComponentBuilder()
+            .WithButton("Send", $"{AutoReplyYesPrefix}{reply.Tag}", ButtonStyle.Success)
+            .WithButton("Dismiss", AutoReplyNoId, ButtonStyle.Secondary)
+            .Build();
+
+        await post.SendMessageAsync(
+            text: $"This message looks like a match for **{reply.Tag}**. Send it?",
+            embed: embed,
+            components: components,
+            allowedMentions: AllowedMentions.None,
+            options: new RequestOptions { CancelToken = ct });
     }
 
     private void PruneExpiredPending()
@@ -978,6 +1097,12 @@ public class DiscordBotService : IHostedService
                 return;
             }
 
+            if (id.StartsWith("ar:"))
+            {
+                await HandleAutoResponderButtonAsync(component, id);
+                return;
+            }
+
             if (!id.StartsWith("cr:"))
                 return;
 
@@ -1139,6 +1264,83 @@ public class DiscordBotService : IHostedService
                 p.Content = $"Failed to send: `{ex.Message}`";
                 p.Components = new ComponentBuilder().Build();
             });
+        }
+    }
+
+    private async Task HandleAutoResponderButtonAsync(SocketMessageComponent component, string id)
+    {
+        if (id == AutoReplyNoId)
+        {
+            await component.UpdateAsync(p =>
+            {
+                p.Content = $"Suggestion dismissed by <@{component.User.Id}>.";
+                p.Embed = null;
+                p.Components = new ComponentBuilder().Build();
+            });
+            return;
+        }
+
+        if (!id.StartsWith(AutoReplyYesPrefix))
+            return;
+
+        var tag = id[AutoReplyYesPrefix.Length..];
+
+        if (component.Channel is not SocketThreadChannel thread || thread.ParentChannel == null)
+        {
+            await component.UpdateAsync(p =>
+            {
+                p.Content = "❌ Not in a thread.";
+                p.Embed = null;
+                p.Components = new ComponentBuilder().Build();
+            });
+            return;
+        }
+
+        var mailbox = _config.Mailboxes.FirstOrDefault(m => m.ForumChannelId == thread.ParentChannel.Id);
+        if (mailbox == null)
+        {
+            await component.UpdateAsync(p =>
+            {
+                p.Content = "This thread isn't bound to a configured mailbox.";
+                p.Embed = null;
+                p.Components = new ComponentBuilder().Build();
+            });
+            return;
+        }
+
+        var body = _cannedReplies.Read(tag);
+        if (body == null)
+        {
+            await component.UpdateAsync(p =>
+            {
+                p.Content = $"Canned reply `{tag}` no longer exists.";
+                p.Embed = null;
+                p.Components = new ComponentBuilder().Build();
+            });
+            return;
+        }
+
+        // Acknowledge and lock the buttons before the (potentially slow) SMTP send.
+        await component.UpdateAsync(p =>
+        {
+            p.Content = $"Sending **{tag}**…";
+            p.Embed = null;
+            p.Components = new ComponentBuilder().Build();
+        });
+
+        try
+        {
+            await SendThreadReplyAsync(thread, mailbox, body, [], CancellationToken.None);
+            _threadStore.RecordCannedReplyUsage(tag, mailbox.Email, component.User.Id, thread.Id);
+
+            await component.ModifyOriginalResponseAsync(p =>
+                p.Content = $"<@{component.User.Id}> sent the **{tag}** canned reply.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to send suggested canned reply {Tag} for thread {ThreadId}", tag, thread.Id);
+            await component.ModifyOriginalResponseAsync(p =>
+                p.Content = $"Failed to send **{tag}**: `{ex.Message}`");
         }
     }
 }

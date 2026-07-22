@@ -70,6 +70,7 @@ public class Program
                     services.AddSingleton<StateStore>();
                     services.AddSingleton<ThreadStore>();
                     services.AddSingleton<CannedReplyService>();
+                    services.AddSingleton<AutoresponderService>();
                     services.AddSingleton<ContentConverter>();
                     services.AddSingleton<EmailSender>();
                     services.AddSingleton<DiscordBotService>();
