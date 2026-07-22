@@ -278,7 +278,42 @@ public class EmailPollingService : BackgroundService
             Attachments = attachments,
             ReferencedThreadId = refThreadId,
             Date = mime.Date,
+            IsAutomated = IsAutomatedMail(mime, fromAddr?.Address),
         };
+    }
+
+    private static bool IsAutomatedMail(MimeMessage mime, string? fromAddress)
+    {
+        var headers = mime.Headers;
+
+        // RFC 3834: anything other than "no" means the message was generated automatically.
+        var autoSubmitted = headers["Auto-Submitted"];
+        if (!string.IsNullOrEmpty(autoSubmitted)
+            && !autoSubmitted.Trim().StartsWith("no", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Bulk / list / auto_reply precedence is used by most auto-responders and mailers.
+        var precedence = headers["Precedence"]?.Trim().ToLowerInvariant();
+        if (precedence is "bulk" or "list" or "junk" or "auto_reply")
+            return true;
+
+        // Presence of mailing-list machinery.
+        if (!string.IsNullOrEmpty(headers["List-Id"])
+            || !string.IsNullOrEmpty(headers["List-Unsubscribe"])
+            || !string.IsNullOrEmpty(headers["X-Auto-Response-Suppress"]))
+            return true;
+
+        // Null return-path (<>)
+        if (headers["Return-Path"]?.Trim() == "<>")
+            return true;
+
+        // Common no-reply / system local-parts.
+        var local = fromAddress?.Split('@').FirstOrDefault()?.ToLowerInvariant() ?? "";
+        if (local is "no-reply" or "noreply" or "donotreply" or "do-not-reply"
+            or "mailer-daemon" or "postmaster" or "bounce" or "bounces")
+            return true;
+
+        return false;
     }
 
     private static string StripQuotedReply(string body)
