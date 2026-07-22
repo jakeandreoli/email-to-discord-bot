@@ -10,6 +10,7 @@ public class IncomingEmail
     public List<EmailAttachment> Attachments { get; set; } = new();
     public ulong? ReferencedThreadId { get; set; }
     public DateTimeOffset Date { get; set; }
+    public bool IsAutomated { get; set; }
 }
 
 public class EmailAttachment

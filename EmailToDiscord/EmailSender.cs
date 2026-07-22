@@ -32,6 +32,7 @@ public class EmailSender
         ulong threadId,
         string? inReplyToMessageId,
         IEnumerable<EmailAttachment> attachments,
+        string? footer = null,
         CancellationToken ct = default
     )
     {
@@ -52,6 +53,9 @@ public class EmailSender
         }
 
         var bodyMarkdown = ApplyTemplate(mailbox, markdownBody);
+
+        if (!string.IsNullOrWhiteSpace(footer))
+            bodyMarkdown = $"{bodyMarkdown}\n\n---\n\n{footer.Trim()}";
 
         var builder = new BodyBuilder
         {
